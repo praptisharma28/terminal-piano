@@ -10,22 +10,22 @@ type ActiveNotes = Arc<Mutex<HashMap<char, f32>>>;
 
 fn key_to_freq(key: char) -> Option<f32> {
     match key {
-        'a' => Some(220.00),
-        'w' => Some(233.08),
-        's' => Some(246.94),
-        'd' => Some(261.63),
-        'r' => Some(277.18),
-        'f' => Some(293.66),
-        't' => Some(311.13),
-        'g' => Some(329.63),
-        'h' => Some(349.23),
-        'u' => Some(369.99),
-        'j' => Some(392.00),
-        'i' => Some(415.30),
-        'k' => Some(440.00),
-        'o' => Some(466.16),
-        'l' => Some(493.88),
-        ';' => Some(523.25),
+        'a' => Some(220.00), // A3
+        'w' => Some(233.08), // A#3
+        's' => Some(246.94), // B3
+        'd' => Some(261.63), // C4 (middle C)
+        'r' => Some(277.18), // C#4
+        'f' => Some(293.66), // D4
+        't' => Some(311.13), // D#4
+        'g' => Some(329.63), // E4
+        'h' => Some(349.23), // F4
+        'u' => Some(369.99), // F#4
+        'j' => Some(392.00), // G4
+        'i' => Some(415.30), // G#4
+        'k' => Some(440.00), // A4 (concert A)
+        'o' => Some(466.16), // A#4
+        'l' => Some(493.88), // B4
+        ';' => Some(523.25), // C5
         _ => None,
     }
 }
