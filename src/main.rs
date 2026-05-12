@@ -6,7 +6,84 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute};
 
-type ActiveNotes = Arc<Mutex<HashMap<char, f32>>>;
+const ATTACK:  f32 = 0.01; // seconds to reach full volume
+const DECAY:   f32 = 0.10; // seconds to drop to sustain level
+const SUSTAIN: f32 = 0.70; // volume level held while key is down (0.0 - 1.0)
+const RELEASE: f32 = 0.30; // seconds to fade out after key is released
+
+#[derive(Clone, Copy, PartialEq)]
+enum Stage {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+struct Note {
+    phase:     f32,   // position in the sine wave cycle (0.0 - 1.0)
+    amplitude: f32,   // current volume (0.0 - 1.0)
+    stage:     Stage,
+}
+
+impl Note {
+    fn new() -> Self {
+        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack }
+    }
+
+    fn release(&mut self) {
+        self.stage = Stage::Release;
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stage == Stage::Release && self.amplitude <= 0.0
+    }
+
+    fn tick(&mut self, freq: f32, sample_rate: f32) -> f32 {
+        match self.stage {
+            Stage::Attack => {
+                self.amplitude += 1.0 / (ATTACK * sample_rate);
+                if self.amplitude >= 1.0 {
+                    self.amplitude = 1.0;
+                    self.stage = Stage::Decay;
+                }
+            }
+            Stage::Decay => {
+                self.amplitude -= (1.0 - SUSTAIN) / (DECAY * sample_rate);
+                if self.amplitude <= SUSTAIN {
+                    self.amplitude = SUSTAIN;
+                    self.stage = Stage::Sustain;
+                }
+            }
+            Stage::Sustain => {}
+            Stage::Release => {
+                self.amplitude -= SUSTAIN / (RELEASE * sample_rate);
+                if self.amplitude < 0.0 {
+                    self.amplitude = 0.0;
+                }
+            }
+        }
+
+        // harmonics: each partial is a multiple of the base frequency, decreasing in volume
+        let harmonics: &[(f32, f32)] = &[
+            (1.0, 1.00), // fundamental
+            (2.0, 0.50), // octave up
+            (3.0, 0.25), // fifth above that
+            (4.0, 0.12), // two octaves up
+            (5.0, 0.06), // major third above that
+        ];
+
+        let mut sample = 0.0_f32;
+        for (multiple, weight) in harmonics {
+            sample += weight * (2.0 * std::f32::consts::PI * self.phase * multiple).sin();
+        }
+        sample *= self.amplitude * 0.10;
+
+        self.phase = (self.phase + freq / sample_rate) % 1.0;
+        sample
+    }
+}
+
+type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
 
 fn key_to_freq(key: char) -> Option<f32> {
     match key {
@@ -48,12 +125,12 @@ fn main() -> anyhow::Result<()> {
             let mut notes = notes_for_audio.lock().unwrap();
             for sample in output.iter_mut() {
                 *sample = 0.0;
-                for (key, phase) in notes.iter_mut() {
+                for (key, note) in notes.iter_mut() {
                     if let Some(freq) = key_to_freq(*key) {
-                        *sample += 0.15 * (2.0 * std::f32::consts::PI * *phase).sin();
-                        *phase = (*phase + freq / sample_rate) % 1.0;
+                        *sample += note.tick(freq, sample_rate);
                     }
                 }
+                notes.retain(|_, note| !note.is_finished());
             }
         },
         |err| eprintln!("audio error: {err}"),
@@ -74,9 +151,11 @@ fn main() -> anyhow::Result<()> {
                 KeyCode::Char(c) => {
                     let mut notes = active_notes.lock().unwrap();
                     if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
-                        notes.entry(c).or_insert(0.0);
+                        notes.entry(c).or_insert_with(Note::new);
                     } else if kind == KeyEventKind::Release {
-                        notes.remove(&c);
+                        if let Some(note) = notes.get_mut(&c) {
+                            note.release();
+                        }
                     }
                 }
                 _ => {}
