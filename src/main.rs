@@ -4,12 +4,16 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::terminal::{self, ClearType};
-use crossterm::{cursor, execute};
+use crossterm::{cursor, execute, queue};
+use std::io::Write;
 
 const ATTACK:  f32 = 0.01; // seconds to reach full volume
 const DECAY:   f32 = 0.10; // seconds to drop to sustain level
 const SUSTAIN: f32 = 0.70; // volume level held while key is down (0.0 - 1.0)
 const RELEASE: f32 = 0.30; // seconds to fade out after key is released
+
+const MIN_OCTAVE: i32 = -3;
+const MAX_OCTAVE: i32 =  3;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
@@ -20,8 +24,8 @@ enum Stage {
 }
 
 struct Note {
-    phase:     f32,   // position in the sine wave cycle (0.0 - 1.0)
-    amplitude: f32,   // current volume (0.0 - 1.0)
+    phase:     f32,
+    amplitude: f32,
     stage:     Stage,
 }
 
@@ -83,7 +87,8 @@ impl Note {
     }
 }
 
-type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
+type ActiveNotes   = Arc<Mutex<HashMap<char, Note>>>;
+type OctaveShift   = Arc<Mutex<i32>>;
 
 fn key_to_freq(key: char) -> Option<f32> {
     match key {
@@ -109,6 +114,7 @@ fn key_to_freq(key: char) -> Option<f32> {
 
 fn main() -> anyhow::Result<()> {
     let active_notes: ActiveNotes = Arc::new(Mutex::new(HashMap::new()));
+    let octave_shift: OctaveShift = Arc::new(Mutex::new(0));
 
     let host = cpal::default_host();
     let device = host
@@ -117,17 +123,22 @@ fn main() -> anyhow::Result<()> {
     let config = device.default_output_config()?;
     let sample_rate = config.sample_rate().0 as f32;
 
-    let notes_for_audio = Arc::clone(&active_notes);
+    let notes_for_audio  = Arc::clone(&active_notes);
+    let octave_for_audio = Arc::clone(&octave_shift);
 
     let stream = device.build_output_stream(
         &config.into(),
         move |output: &mut [f32], _| {
             let mut notes = notes_for_audio.lock().unwrap();
+            let shift = *octave_for_audio.lock().unwrap();
+            // 2^shift: shift=1 doubles the frequency (one octave up), shift=-1 halves it
+            let octave_multiplier = 2.0_f32.powi(shift);
+
             for sample in output.iter_mut() {
                 *sample = 0.0;
                 for (key, note) in notes.iter_mut() {
                     if let Some(freq) = key_to_freq(*key) {
-                        *sample += note.tick(freq, sample_rate);
+                        *sample += note.tick(freq * octave_multiplier, sample_rate);
                     }
                 }
                 notes.retain(|_, note| !note.is_finished());
@@ -142,12 +153,33 @@ fn main() -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
-    print_keyboard();
+    print_ui(&mut stdout, 0)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => break,
+
+                KeyCode::Char('z') if kind == KeyEventKind::Press => {
+                    let mut shift = octave_shift.lock().unwrap();
+                    if *shift > MIN_OCTAVE {
+                        *shift -= 1;
+                        let s = *shift;
+                        drop(shift);
+                        print_ui(&mut stdout, s)?;
+                    }
+                }
+
+                KeyCode::Char('x') if kind == KeyEventKind::Press => {
+                    let mut shift = octave_shift.lock().unwrap();
+                    if *shift < MAX_OCTAVE {
+                        *shift += 1;
+                        let s = *shift;
+                        drop(shift);
+                        print_ui(&mut stdout, s)?;
+                    }
+                }
+
                 KeyCode::Char(c) => {
                     let mut notes = active_notes.lock().unwrap();
                     if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
@@ -158,6 +190,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+
                 _ => {}
             }
         }
@@ -169,13 +202,23 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_keyboard() {
-    println!("\r");
-    println!("  Terminal Piano\r");
-    println!("\r");
-    println!("  White keys:  A  S  D  F  G  H  J  K  L  ;\r");
-    println!("  Black keys:  W     R     T     U  I     O\r");
-    println!("\r");
-    println!("  Q or ESC to quit\r");
-    println!("\r");
+fn print_ui(stdout: &mut impl Write, octave: i32) -> anyhow::Result<()> {
+    let label = match octave {
+        0 => "Octave:  0  (default)".to_string(),
+        n if n > 0 => format!("Octave: +{}  (Z to go down)", n),
+        n => format!("Octave: {}  (X to go up)", n),
+    };
+
+    queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  Terminal Piano\r")?;
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  White keys:  A  S  D  F  G  H  J  K  L  ;\r")?;
+    writeln!(stdout, "  Black keys:  W     R     T     U  I     O\r")?;
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  {}\r", label)?;
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  Z = octave down  |  X = octave up  |  Q / ESC = quit\r")?;
+    stdout.flush()?;
+    Ok(())
 }
