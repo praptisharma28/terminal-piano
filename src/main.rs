@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::io::Write;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
-use std::io::Write;
 
 const ATTACK:  f32 = 0.01; // seconds to reach full volume
 const DECAY:   f32 = 0.10; // seconds to drop to sustain level
@@ -27,11 +28,12 @@ struct Note {
     phase:     f32,
     amplitude: f32,
     stage:     Stage,
+    velocity:  f32, // 0.0 (silent) to 1.0 (full force), captured at key press
 }
 
 impl Note {
-    fn new() -> Self {
-        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack }
+    fn new(velocity: f32) -> Self {
+        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack, velocity }
     }
 
     fn release(&mut self) {
@@ -67,28 +69,30 @@ impl Note {
             }
         }
 
-        // harmonics: each partial is a multiple of the base frequency, decreasing in volume
+        let v = self.velocity;
+
+        // higher harmonics scale with velocity: loud = bright, soft = warm
         let harmonics: &[(f32, f32)] = &[
-            (1.0, 1.00), // fundamental
-            (2.0, 0.50), // octave up
-            (3.0, 0.25), // fifth above that
-            (4.0, 0.12), // two octaves up
-            (5.0, 0.06), // major third above that
+            (1.0, 1.00),       // fundamental — always present
+            (2.0, 0.50 * v),   // octave up
+            (3.0, 0.25 * v),   // fifth above that
+            (4.0, 0.12 * v*v), // two octaves up — drops fast at low velocity
+            (5.0, 0.06 * v*v), // major third above that
         ];
 
         let mut sample = 0.0_f32;
         for (multiple, weight) in harmonics {
             sample += weight * (2.0 * std::f32::consts::PI * self.phase * multiple).sin();
         }
-        sample *= self.amplitude * 0.10;
+        sample *= self.amplitude * self.velocity * 0.12;
 
         self.phase = (self.phase + freq / sample_rate) % 1.0;
         sample
     }
 }
 
-type ActiveNotes   = Arc<Mutex<HashMap<char, Note>>>;
-type OctaveShift   = Arc<Mutex<i32>>;
+type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
+type OctaveShift = Arc<Mutex<i32>>;
 
 fn key_to_freq(key: char) -> Option<f32> {
     match key {
@@ -153,7 +157,10 @@ fn main() -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
-    print_ui(&mut stdout, 0)?;
+
+    // default velocity: mezzo-forte (5 out of 9)
+    let mut velocity: f32 = 5.0 / 9.0;
+    print_ui(&mut stdout, 0, &HashSet::new(), velocity)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
@@ -166,7 +173,8 @@ fn main() -> anyhow::Result<()> {
                         *shift -= 1;
                         let s = *shift;
                         drop(shift);
-                        print_ui(&mut stdout, s)?;
+                        let pressed = pressed_keys(&active_notes);
+                        print_ui(&mut stdout, s, &pressed, velocity)?;
                     }
                 }
 
@@ -176,19 +184,34 @@ fn main() -> anyhow::Result<()> {
                         *shift += 1;
                         let s = *shift;
                         drop(shift);
-                        print_ui(&mut stdout, s)?;
+                        let pressed = pressed_keys(&active_notes);
+                        print_ui(&mut stdout, s, &pressed, velocity)?;
                     }
                 }
 
+                // number keys 1-9 set velocity
+                KeyCode::Char(c @ '1'..='9') if kind == KeyEventKind::Press => {
+                    let n = c.to_digit(10).unwrap() as f32;
+                    velocity = n / 9.0;
+                    let pressed = pressed_keys(&active_notes);
+                    let octave = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity)?;
+                }
+
                 KeyCode::Char(c) => {
-                    let mut notes = active_notes.lock().unwrap();
-                    if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
-                        notes.entry(c).or_insert_with(Note::new);
-                    } else if kind == KeyEventKind::Release {
-                        if let Some(note) = notes.get_mut(&c) {
-                            note.release();
+                    let pressed = {
+                        let mut notes = active_notes.lock().unwrap();
+                        if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
+                            notes.entry(c).or_insert_with(|| Note::new(velocity));
+                        } else if kind == KeyEventKind::Release {
+                            if let Some(note) = notes.get_mut(&c) {
+                                note.release();
+                            }
                         }
-                    }
+                        collect_pressed(&notes)
+                    };
+                    let octave = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity)?;
                 }
 
                 _ => {}
@@ -202,23 +225,76 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_ui(stdout: &mut impl Write, octave: i32) -> anyhow::Result<()> {
-    let label = match octave {
+fn collect_pressed(notes: &HashMap<char, Note>) -> HashSet<char> {
+    notes
+        .iter()
+        .filter(|(_, n)| n.stage != Stage::Release)
+        .map(|(k, _)| *k)
+        .collect()
+}
+
+fn pressed_keys(active_notes: &ActiveNotes) -> HashSet<char> {
+    collect_pressed(&active_notes.lock().unwrap())
+}
+
+fn write_key(stdout: &mut impl Write, key: char, pressed: &HashSet<char>) -> anyhow::Result<()> {
+    let label = key.to_ascii_uppercase();
+    if pressed.contains(&key) {
+        queue!(
+            stdout,
+            SetBackgroundColor(Color::Yellow),
+            SetForegroundColor(Color::Black),
+            Print(label),
+            ResetColor
+        )?;
+    } else {
+        queue!(stdout, Print(label))?;
+    }
+    Ok(())
+}
+
+fn print_ui(stdout: &mut impl Write, octave: i32, pressed: &HashSet<char>, velocity: f32) -> anyhow::Result<()> {
+    let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
         n if n > 0 => format!("Octave: +{}  (Z to go down)", n),
         n => format!("Octave: {}  (X to go up)", n),
     };
 
+    let level = (velocity * 9.0).round() as usize;
+    let bar: String = (1..=9).map(|i| if i <= level { '█' } else { '░' }).collect();
+    let vel_label = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
+
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+
+    let white_keys = ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';'];
+    let black_keys = [Some('w'), None, Some('r'), None, Some('t'), Some('u'), Some('i'), None, Some('o'), None];
+
     writeln!(stdout, "\r")?;
     writeln!(stdout, "  Terminal Piano\r")?;
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  White keys:  A  S  D  F  G  H  J  K  L  ;\r")?;
-    writeln!(stdout, "  Black keys:  W     R     T     U  I     O\r")?;
+
+    write!(stdout, "  White:  ")?;
+    for key in white_keys {
+        write_key(stdout, key, pressed)?;
+        write!(stdout, "  ")?;
+    }
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  {}\r", label)?;
+
+    write!(stdout, "  Black:  ")?;
+    for slot in black_keys {
+        match slot {
+            Some(key) => { write_key(stdout, key, pressed)?; write!(stdout, "  ")?; }
+            None      => { write!(stdout, "   ")?; }
+        }
+    }
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  Z = octave down  |  X = octave up  |  Q / ESC = quit\r")?;
+
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  {}\r", octave_label)?;
+    writeln!(stdout, "  {}\r", vel_label)?;
+    writeln!(stdout, "\r")?;
+    writeln!(stdout, "  Z = octave down  |  X = octave up  |  1-9 = velocity  |  Q / ESC = quit\r")?;
+
     stdout.flush()?;
     Ok(())
 }
