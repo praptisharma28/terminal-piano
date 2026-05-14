@@ -25,15 +25,16 @@ enum Stage {
 }
 
 struct Note {
-    phase:     f32,
-    amplitude: f32,
-    stage:     Stage,
-    velocity:  f32, // 0.0 (silent) to 1.0 (full force), captured at key press
+    phase:        f32,
+    amplitude:    f32,
+    stage:        Stage,
+    velocity:     f32,  // 0.0 (silent) to 1.0 (full force), captured at key press
+    key_released: bool, // key was lifted while pedal was down — pedal is keeping this note alive
 }
 
 impl Note {
     fn new(velocity: f32) -> Self {
-        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack, velocity }
+        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack, velocity, key_released: false }
     }
 
     fn release(&mut self) {
@@ -158,14 +159,34 @@ fn main() -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
 
-    // default velocity: mezzo-forte (5 out of 9)
-    let mut velocity: f32 = 5.0 / 9.0;
-    print_ui(&mut stdout, 0, &HashSet::new(), velocity)?;
+    let mut velocity:   f32  = 5.0 / 9.0; // default: mezzo-forte (5 out of 9)
+    let mut pedal_down: bool = false;
+
+    print_ui(&mut stdout, 0, &HashSet::new(), velocity, pedal_down)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => break,
+
+                // sustain pedal
+                KeyCode::Char(' ') => {
+                    if kind == KeyEventKind::Press && !pedal_down {
+                        pedal_down = true;
+                    } else if kind == KeyEventKind::Release && pedal_down {
+                        pedal_down = false;
+                        // release all notes the pedal was holding after the key was lifted
+                        let mut notes = active_notes.lock().unwrap();
+                        for note in notes.values_mut() {
+                            if note.key_released {
+                                note.release();
+                            }
+                        }
+                    }
+                    let pressed = pressed_keys(&active_notes);
+                    let octave  = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
+                }
 
                 KeyCode::Char('z') if kind == KeyEventKind::Press => {
                     let mut shift = octave_shift.lock().unwrap();
@@ -174,7 +195,7 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity)?;
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down)?;
                     }
                 }
 
@@ -185,7 +206,7 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity)?;
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down)?;
                     }
                 }
 
@@ -194,8 +215,8 @@ fn main() -> anyhow::Result<()> {
                     let n = c.to_digit(10).unwrap() as f32;
                     velocity = n / 9.0;
                     let pressed = pressed_keys(&active_notes);
-                    let octave = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity)?;
+                    let octave  = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
                 }
 
                 KeyCode::Char(c) => {
@@ -205,13 +226,17 @@ fn main() -> anyhow::Result<()> {
                             notes.entry(c).or_insert_with(|| Note::new(velocity));
                         } else if kind == KeyEventKind::Release {
                             if let Some(note) = notes.get_mut(&c) {
-                                note.release();
+                                if pedal_down {
+                                    note.key_released = true;
+                                } else {
+                                    note.release();
+                                }
                             }
                         }
                         collect_pressed(&notes)
                     };
                     let octave = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity)?;
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
                 }
 
                 _ => {}
@@ -253,7 +278,13 @@ fn write_key(stdout: &mut impl Write, key: char, pressed: &HashSet<char>) -> any
     Ok(())
 }
 
-fn print_ui(stdout: &mut impl Write, octave: i32, pressed: &HashSet<char>, velocity: f32) -> anyhow::Result<()> {
+fn print_ui(
+    stdout:     &mut impl Write,
+    octave:     i32,
+    pressed:    &HashSet<char>,
+    velocity:   f32,
+    pedal_down: bool,
+) -> anyhow::Result<()> {
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
         n if n > 0 => format!("Octave: +{}  (Z to go down)", n),
@@ -263,6 +294,8 @@ fn print_ui(stdout: &mut impl Write, octave: i32, pressed: &HashSet<char>, veloc
     let level = (velocity * 9.0).round() as usize;
     let bar: String = (1..=9).map(|i| if i <= level { '█' } else { '░' }).collect();
     let vel_label = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
+
+    let pedal_label = if pedal_down { "Pedal: DOWN" } else { "Pedal: up  " };
 
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -292,8 +325,9 @@ fn print_ui(stdout: &mut impl Write, octave: i32, pressed: &HashSet<char>, veloc
     writeln!(stdout, "\r")?;
     writeln!(stdout, "  {}\r", octave_label)?;
     writeln!(stdout, "  {}\r", vel_label)?;
+    writeln!(stdout, "  {}\r", pedal_label)?;
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  Z = octave down  |  X = octave up  |  1-9 = velocity  |  Q / ESC = quit\r")?;
+    writeln!(stdout, "  SPACE = pedal  |  Z/X = octave  |  1-9 = velocity  |  Q / ESC = quit\r")?;
 
     stdout.flush()?;
     Ok(())
