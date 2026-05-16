@@ -24,17 +24,46 @@ enum Stage {
     Release,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Waveform {
+    Sine,
+    Triangle,
+    Square,
+    Sawtooth,
+}
+
+impl Waveform {
+    fn next(self) -> Self {
+        match self {
+            Waveform::Sine     => Waveform::Triangle,
+            Waveform::Triangle => Waveform::Square,
+            Waveform::Square   => Waveform::Sawtooth,
+            Waveform::Sawtooth => Waveform::Sine,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Waveform::Sine     => "Sine     — pure, clean",
+            Waveform::Triangle => "Triangle — soft, hollow",
+            Waveform::Square   => "Square   — reedy, nasal",
+            Waveform::Sawtooth => "Sawtooth — bright, buzzy",
+        }
+    }
+}
+
 struct Note {
     phase:        f32,
     amplitude:    f32,
     stage:        Stage,
-    velocity:     f32,  // 0.0 (silent) to 1.0 (full force), captured at key press
-    key_released: bool, // key was lifted while pedal was down — pedal is keeping this note alive
+    velocity:     f32,     // 0.0 (silent) to 1.0 (full force), captured at key press
+    waveform:     Waveform, // captured at key press
+    key_released: bool,    // key was lifted while pedal was down — pedal is keeping this note alive
 }
 
 impl Note {
-    fn new(velocity: f32) -> Self {
-        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack, velocity, key_released: false }
+    fn new(velocity: f32, waveform: Waveform) -> Self {
+        Note { phase: 0.0, amplitude: 0.0, stage: Stage::Attack, velocity, waveform, key_released: false }
     }
 
     fn release(&mut self) {
@@ -70,25 +99,47 @@ impl Note {
             }
         }
 
-        let v = self.velocity;
+        let v  = self.velocity;
+        let p  = self.phase;
+        let pi = std::f32::consts::PI;
 
-        // higher harmonics scale with velocity: loud = bright, soft = warm
-        let harmonics: &[(f32, f32)] = &[
-            (1.0, 1.00),       // fundamental — always present
-            (2.0, 0.50 * v),   // octave up
-            (3.0, 0.25 * v),   // fifth above that
-            (4.0, 0.12 * v*v), // two octaves up — drops fast at low velocity
-            (5.0, 0.06 * v*v), // major third above that
-        ];
+        // Each waveform is defined by its harmonic series.
+        // Velocity scales upper harmonics — loud = bright, soft = warm.
+        let (wave, gain) = match self.waveform {
+            Waveform::Sine => (
+                (2.0 * pi * p).sin(),
+                1.0,
+            ),
+            Waveform::Triangle => (
+                // odd harmonics, alternating sign, weights fall as 1/n²
+                  1.000 * (2.0 * pi * 1.0 * p).sin()
+                - 0.111 * v * (2.0 * pi * 3.0 * p).sin()
+                + 0.040 * v * (2.0 * pi * 5.0 * p).sin()
+                - 0.020 * v * (2.0 * pi * 7.0 * p).sin(),
+                0.90,
+            ),
+            Waveform::Square => (
+                // odd harmonics only, weights fall as 1/n
+                  1.000 * (2.0 * pi * 1.0 * p).sin()
+                + 0.333 * v * (2.0 * pi * 3.0 * p).sin()
+                + 0.200 * v * (2.0 * pi * 5.0 * p).sin()
+                + 0.143 * v * (2.0 * pi * 7.0 * p).sin(),
+                0.60,
+            ),
+            Waveform::Sawtooth => (
+                // all harmonics, weights fall as 1/n
+                  1.000       * (2.0 * pi * 1.0 * p).sin()
+                + 0.500 * v   * (2.0 * pi * 2.0 * p).sin()
+                + 0.333 * v   * (2.0 * pi * 3.0 * p).sin()
+                + 0.250 * v*v * (2.0 * pi * 4.0 * p).sin()
+                + 0.200 * v*v * (2.0 * pi * 5.0 * p).sin(),
+                0.50,
+            ),
+        };
 
-        let mut sample = 0.0_f32;
-        for (multiple, weight) in harmonics {
-            sample += weight * (2.0 * std::f32::consts::PI * self.phase * multiple).sin();
-        }
-        sample *= self.amplitude * self.velocity * 0.12;
-
+        let out = wave * gain * self.amplitude * self.velocity * 0.15;
         self.phase = (self.phase + freq / sample_rate) % 1.0;
-        sample
+        out
     }
 }
 
@@ -159,10 +210,11 @@ fn main() -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
 
-    let mut velocity:   f32  = 5.0 / 9.0; // default: mezzo-forte (5 out of 9)
-    let mut pedal_down: bool = false;
+    let mut velocity:   f32      = 5.0 / 9.0;    // default: mezzo-forte (5 out of 9)
+    let mut pedal_down: bool     = false;
+    let mut waveform:   Waveform = Waveform::Sine;
 
-    print_ui(&mut stdout, 0, &HashSet::new(), velocity, pedal_down)?;
+    print_ui(&mut stdout, 0, &HashSet::new(), velocity, pedal_down, waveform)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
@@ -175,7 +227,6 @@ fn main() -> anyhow::Result<()> {
                         pedal_down = true;
                     } else if kind == KeyEventKind::Release && pedal_down {
                         pedal_down = false;
-                        // release all notes the pedal was holding after the key was lifted
                         let mut notes = active_notes.lock().unwrap();
                         for note in notes.values_mut() {
                             if note.key_released {
@@ -185,7 +236,15 @@ fn main() -> anyhow::Result<()> {
                     }
                     let pressed = pressed_keys(&active_notes);
                     let octave  = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
+                }
+
+                // cycle waveform
+                KeyCode::Char('[') if kind == KeyEventKind::Press => {
+                    waveform = waveform.next();
+                    let pressed = pressed_keys(&active_notes);
+                    let octave  = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
                 }
 
                 KeyCode::Char('z') if kind == KeyEventKind::Press => {
@@ -195,7 +254,7 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down)?;
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform)?;
                     }
                 }
 
@@ -206,7 +265,7 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down)?;
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform)?;
                     }
                 }
 
@@ -216,14 +275,14 @@ fn main() -> anyhow::Result<()> {
                     velocity = n / 9.0;
                     let pressed = pressed_keys(&active_notes);
                     let octave  = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
                 }
 
                 KeyCode::Char(c) => {
                     let pressed = {
                         let mut notes = active_notes.lock().unwrap();
                         if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
-                            notes.entry(c).or_insert_with(|| Note::new(velocity));
+                            notes.entry(c).or_insert_with(|| Note::new(velocity, waveform));
                         } else if kind == KeyEventKind::Release {
                             if let Some(note) = notes.get_mut(&c) {
                                 if pedal_down {
@@ -236,7 +295,7 @@ fn main() -> anyhow::Result<()> {
                         collect_pressed(&notes)
                     };
                     let octave = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down)?;
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
                 }
 
                 _ => {}
@@ -284,6 +343,7 @@ fn print_ui(
     pressed:    &HashSet<char>,
     velocity:   f32,
     pedal_down: bool,
+    waveform:   Waveform,
 ) -> anyhow::Result<()> {
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
@@ -293,9 +353,9 @@ fn print_ui(
 
     let level = (velocity * 9.0).round() as usize;
     let bar: String = (1..=9).map(|i| if i <= level { '█' } else { '░' }).collect();
-    let vel_label = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
-
+    let vel_label   = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
     let pedal_label = if pedal_down { "Pedal: DOWN" } else { "Pedal: up  " };
+    let wave_label  = format!("Waveform: {}  ([ to cycle)", waveform.name());
 
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -326,8 +386,9 @@ fn print_ui(
     writeln!(stdout, "  {}\r", octave_label)?;
     writeln!(stdout, "  {}\r", vel_label)?;
     writeln!(stdout, "  {}\r", pedal_label)?;
+    writeln!(stdout, "  {}\r", wave_label)?;
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  SPACE = pedal  |  Z/X = octave  |  1-9 = velocity  |  Q / ESC = quit\r")?;
+    writeln!(stdout, "  SPACE = pedal  |  Z/X = octave  |  1-9 = velocity  |  [ = waveform  |  Q / ESC = quit\r")?;
 
     stdout.flush()?;
     Ok(())
