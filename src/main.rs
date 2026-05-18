@@ -143,8 +143,122 @@ impl Note {
     }
 }
 
-type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
-type OctaveShift = Arc<Mutex<i32>>;
+type ActiveNotes  = Arc<Mutex<HashMap<char, Note>>>;
+type OctaveShift  = Arc<Mutex<i32>>;
+type ReverbMix    = Arc<Mutex<f32>>;
+
+// Schroeder reverb: four parallel comb filters.
+// Each delays the signal and feeds it back into itself.
+// Different delay lengths create the illusion of multiple reflections.
+struct Reverb {
+    buffers:   [Vec<f32>; 4],
+    positions: [usize; 4],
+}
+
+impl Reverb {
+    fn new(sample_rate: f32) -> Self {
+        let ms = |t: f32| (sample_rate * t * 0.001) as usize;
+        Reverb {
+            buffers: [
+                vec![0.0; ms(29.7)], // delay lengths from Schroeder's original paper
+                vec![0.0; ms(37.1)],
+                vec![0.0; ms(41.1)],
+                vec![0.0; ms(43.7)],
+            ],
+            positions: [0; 4],
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let gains = [0.805_f32, 0.827, 0.783, 0.764]; // feedback amount per filter
+        let mut output = 0.0_f32;
+        for i in 0..4 {
+            let pos     = self.positions[i];
+            let delayed = self.buffers[i][pos];
+            self.buffers[i][pos] = input + gains[i] * delayed;
+            self.positions[i]    = (pos + 1) % self.buffers[i].len();
+            output += delayed;
+        }
+        output * 0.25 // average across the four filters
+    }
+}
+
+fn key_to_pitch_class(key: char) -> Option<u8> {
+    match key {
+        'a' | 'k' => Some(9),  // A
+        'w' | 'o' => Some(10), // A#
+        's' | 'l' => Some(11), // B
+        'd' | ';' => Some(0),  // C
+        'r'       => Some(1),  // C#
+        'f'       => Some(2),  // D
+        't'       => Some(3),  // D#
+        'g'       => Some(4),  // E
+        'h'       => Some(5),  // F
+        'u'       => Some(6),  // F#
+        'j'       => Some(7),  // G
+        'i'       => Some(8),  // G#
+        _         => None,
+    }
+}
+
+fn note_name(pc: u8) -> &'static str {
+    match pc {
+        0  => "C",  1  => "C#", 2  => "D",  3  => "D#",
+        4  => "E",  5  => "F",  6  => "F#", 7  => "G",
+        8  => "G#", 9  => "A",  10 => "A#", 11 => "B",
+        _  => "?",
+    }
+}
+
+fn detect_chord(pressed: &HashSet<char>) -> String {
+    // Collect unique pitch classes regardless of octave, sorted
+    let pcs: Vec<u8> = pressed
+        .iter()
+        .filter_map(|&k| key_to_pitch_class(k))
+        .collect::<std::collections::BTreeSet<u8>>()
+        .into_iter()
+        .collect();
+
+    match pcs.len() {
+        0 => return String::new(),
+        1 => return note_name(pcs[0]).to_string(),
+        _ => {}
+    }
+
+    // (name, interval pattern from root in semitones)
+    let shapes: &[(&str, &[u8])] = &[
+        ("maj",  &[0, 4, 7]),
+        ("min",  &[0, 3, 7]),
+        ("dim",  &[0, 3, 6]),
+        ("aug",  &[0, 4, 8]),
+        ("sus2", &[0, 2, 7]),
+        ("sus4", &[0, 5, 7]),
+        ("maj7", &[0, 4, 7, 11]),
+        ("min7", &[0, 3, 7, 10]),
+        ("7",    &[0, 4, 7, 10]),
+        ("dim7", &[0, 3, 6, 9]),
+        ("m7b5", &[0, 3, 6, 10]),
+    ];
+
+    // Try every note as root — this handles all inversions
+    for &root in &pcs {
+        let mut intervals: Vec<u8> = pcs
+            .iter()
+            .map(|&pc| (pc + 12 - root) % 12)
+            .collect();
+        intervals.sort();
+        intervals.dedup();
+
+        for &(name, shape) in shapes {
+            if intervals == shape {
+                return format!("{} {}", note_name(root), name);
+            }
+        }
+    }
+
+    // No named chord — list the notes
+    pcs.iter().map(|&pc| note_name(pc)).collect::<Vec<_>>().join(" ")
+}
 
 fn key_to_freq(key: char) -> Option<f32> {
     match key {
@@ -171,6 +285,7 @@ fn key_to_freq(key: char) -> Option<f32> {
 fn main() -> anyhow::Result<()> {
     let active_notes: ActiveNotes = Arc::new(Mutex::new(HashMap::new()));
     let octave_shift: OctaveShift = Arc::new(Mutex::new(0));
+    let reverb_mix:   ReverbMix   = Arc::new(Mutex::new(0.3)); // default: light room reverb
 
     let host = cpal::default_host();
     let device = host
@@ -181,12 +296,16 @@ fn main() -> anyhow::Result<()> {
 
     let notes_for_audio  = Arc::clone(&active_notes);
     let octave_for_audio = Arc::clone(&octave_shift);
+    let mix_for_audio    = Arc::clone(&reverb_mix);
+
+    let mut reverb = Reverb::new(sample_rate);
 
     let stream = device.build_output_stream(
         &config.into(),
         move |output: &mut [f32], _| {
             let mut notes = notes_for_audio.lock().unwrap();
             let shift = *octave_for_audio.lock().unwrap();
+            let mix   = *mix_for_audio.lock().unwrap();
             // 2^shift: shift=1 doubles the frequency (one octave up), shift=-1 halves it
             let octave_multiplier = 2.0_f32.powi(shift);
 
@@ -198,6 +317,10 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 notes.retain(|_, note| !note.is_finished());
+
+                let dry = *sample;
+                let wet = reverb.process(dry);
+                *sample = dry * (1.0 - mix) + wet * mix;
             }
         },
         |err| eprintln!("audio error: {err}"),
@@ -214,7 +337,7 @@ fn main() -> anyhow::Result<()> {
     let mut pedal_down: bool     = false;
     let mut waveform:   Waveform = Waveform::Sine;
 
-    print_ui(&mut stdout, 0, &HashSet::new(), velocity, pedal_down, waveform)?;
+    print_ui(&mut stdout, 0, &HashSet::new(), velocity, pedal_down, waveform, 0.3)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
@@ -236,7 +359,8 @@ fn main() -> anyhow::Result<()> {
                     }
                     let pressed = pressed_keys(&active_notes);
                     let octave  = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
+                    let mix     = *reverb_mix.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix)?;
                 }
 
                 // cycle waveform
@@ -244,7 +368,29 @@ fn main() -> anyhow::Result<()> {
                     waveform = waveform.next();
                     let pressed = pressed_keys(&active_notes);
                     let octave  = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
+                    let mix     = *reverb_mix.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix)?;
+                }
+
+                // reverb mix: - to decrease, = to increase
+                KeyCode::Char('-') if kind == KeyEventKind::Press => {
+                    let mut mix = reverb_mix.lock().unwrap();
+                    *mix = (*mix - 0.1).max(0.0);
+                    let m = *mix;
+                    drop(mix);
+                    let pressed = pressed_keys(&active_notes);
+                    let octave  = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, m)?;
+                }
+
+                KeyCode::Char('=') if kind == KeyEventKind::Press => {
+                    let mut mix = reverb_mix.lock().unwrap();
+                    *mix = (*mix + 0.1).min(0.8);
+                    let m = *mix;
+                    drop(mix);
+                    let pressed = pressed_keys(&active_notes);
+                    let octave  = *octave_shift.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, m)?;
                 }
 
                 KeyCode::Char('z') if kind == KeyEventKind::Press => {
@@ -254,7 +400,8 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform)?;
+                        let mix     = *reverb_mix.lock().unwrap();
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform, mix)?;
                     }
                 }
 
@@ -265,7 +412,8 @@ fn main() -> anyhow::Result<()> {
                         let s = *shift;
                         drop(shift);
                         let pressed = pressed_keys(&active_notes);
-                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform)?;
+                        let mix     = *reverb_mix.lock().unwrap();
+                        print_ui(&mut stdout, s, &pressed, velocity, pedal_down, waveform, mix)?;
                     }
                 }
 
@@ -275,7 +423,8 @@ fn main() -> anyhow::Result<()> {
                     velocity = n / 9.0;
                     let pressed = pressed_keys(&active_notes);
                     let octave  = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
+                    let mix     = *reverb_mix.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix)?;
                 }
 
                 KeyCode::Char(c) => {
@@ -295,7 +444,8 @@ fn main() -> anyhow::Result<()> {
                         collect_pressed(&notes)
                     };
                     let octave = *octave_shift.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform)?;
+                    let mix    = *reverb_mix.lock().unwrap();
+                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix)?;
                 }
 
                 _ => {}
@@ -344,6 +494,7 @@ fn print_ui(
     velocity:   f32,
     pedal_down: bool,
     waveform:   Waveform,
+    reverb:     f32,
 ) -> anyhow::Result<()> {
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
@@ -356,6 +507,12 @@ fn print_ui(
     let vel_label   = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
     let pedal_label = if pedal_down { "Pedal: DOWN" } else { "Pedal: up  " };
     let wave_label  = format!("Waveform: {}  ([ to cycle)", waveform.name());
+
+    let rvb_steps = (reverb * 10.0).round() as usize;
+    let rvb_bar: String = (1..=8).map(|i| if i <= rvb_steps { '█' } else { '░' }).collect();
+    let rvb_label = format!("Reverb:   {}  (- / = to adjust)", rvb_bar);
+
+    let chord = detect_chord(pressed);
 
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -383,12 +540,26 @@ fn print_ui(
     writeln!(stdout, "\r")?;
 
     writeln!(stdout, "\r")?;
+    if chord.is_empty() {
+        writeln!(stdout, "  Chord:   —\r")?;
+    } else {
+        write!(stdout, "  Chord:   ")?;
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Cyan),
+            Print(format!("{:<16}", chord)),
+            ResetColor
+        )?;
+        writeln!(stdout, "\r")?;
+    }
+    writeln!(stdout, "\r")?;
     writeln!(stdout, "  {}\r", octave_label)?;
     writeln!(stdout, "  {}\r", vel_label)?;
     writeln!(stdout, "  {}\r", pedal_label)?;
     writeln!(stdout, "  {}\r", wave_label)?;
+    writeln!(stdout, "  {}\r", rvb_label)?;
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  SPACE = pedal  |  Z/X = octave  |  1-9 = velocity  |  [ = waveform  |  Q / ESC = quit\r")?;
+    writeln!(stdout, "  SPACE = pedal  |  Z/X = octave  |  1-9 = velocity  |  [ = waveform  |  -/= = reverb  |  Q / ESC = quit\r")?;
 
     stdout.flush()?;
     Ok(())
