@@ -53,6 +53,52 @@ impl Waveform {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Scale {
+    Major,
+    NaturalMinor,
+    PentatonicMajor,
+    PentatonicMinor,
+    Blues,
+}
+
+impl Scale {
+    fn intervals(self) -> &'static [u8] {
+        match self {
+            Scale::Major           => &[0, 2, 4, 5, 7, 9, 11],
+            Scale::NaturalMinor    => &[0, 2, 3, 5, 7, 8, 10],
+            Scale::PentatonicMajor => &[0, 2, 4, 7, 9],
+            Scale::PentatonicMinor => &[0, 3, 5, 7, 10],
+            Scale::Blues           => &[0, 3, 5, 6, 7, 10],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Scale::Major           => "Major",
+            Scale::NaturalMinor    => "Natural Minor",
+            Scale::PentatonicMajor => "Pentatonic Major",
+            Scale::PentatonicMinor => "Pentatonic Minor",
+            Scale::Blues           => "Blues",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Scale::Major           => Scale::NaturalMinor,
+            Scale::NaturalMinor    => Scale::PentatonicMajor,
+            Scale::PentatonicMajor => Scale::PentatonicMinor,
+            Scale::PentatonicMinor => Scale::Blues,
+            Scale::Blues           => Scale::Major,
+        }
+    }
+}
+
+const ROOTS: [(&str, u8); 12] = [
+    ("C", 0), ("C#", 1), ("D", 2), ("D#", 3), ("E", 4),  ("F", 5),
+    ("F#", 6), ("G", 7), ("G#", 8), ("A", 9),  ("A#", 10), ("B", 11),
+];
+
 #[derive(Clone, Copy)]
 enum RecordKind { Press, Release }
 
@@ -350,21 +396,24 @@ fn main() -> anyhow::Result<()> {
     let mut recording:    bool                 = false;
     let mut record_start: Option<Instant>      = None;
     let mut recorded:     Vec<RecordedEvent>   = Vec::new();
+    let mut scale:        Scale                = Scale::Major;
+    let mut root_idx:     usize                = 0; // C
 
     let redraw = |stdout: &mut _, notes: &ActiveNotes, octave_shift: &OctaveShift,
                   reverb_mix: &ReverbMix, is_playing: &IsPlaying,
                   velocity: f32, pedal_down: bool, waveform: Waveform,
-                  recording: bool, recorded: &Vec<RecordedEvent>| -> anyhow::Result<()> {
-        let pressed     = pressed_keys(notes);
-        let octave      = *octave_shift.lock().unwrap();
-        let mix         = *reverb_mix.lock().unwrap();
-        let playing     = *is_playing.lock().unwrap();
+                  recording: bool, recorded: &Vec<RecordedEvent>,
+                  scale: Scale, root_idx: usize| -> anyhow::Result<()> {
+        let pressed = pressed_keys(notes);
+        let octave  = *octave_shift.lock().unwrap();
+        let mix     = *reverb_mix.lock().unwrap();
+        let playing = *is_playing.lock().unwrap();
         print_ui(stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
-                 recording, recorded.len(), playing)
+                 recording, recorded.len(), playing, scale, root_idx)
     };
 
     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-           velocity, pedal_down, waveform, recording, &recorded)?;
+           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
 
     loop {
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
@@ -383,7 +432,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // toggle recording
@@ -396,7 +445,7 @@ fn main() -> anyhow::Result<()> {
                         recording = true;
                     }
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // playback
@@ -430,14 +479,14 @@ fn main() -> anyhow::Result<()> {
                         });
                     }
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // cycle waveform
                 KeyCode::Char('[') if kind == KeyEventKind::Press => {
                     waveform = waveform.next();
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // reverb mix
@@ -446,14 +495,14 @@ fn main() -> anyhow::Result<()> {
                     *mix = (*mix - 0.1).max(0.0);
                     drop(mix);
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
                 KeyCode::Char('=') if kind == KeyEventKind::Press => {
                     let mut mix = reverb_mix.lock().unwrap();
                     *mix = (*mix + 0.1).min(0.8);
                     drop(mix);
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // octave
@@ -462,21 +511,35 @@ fn main() -> anyhow::Result<()> {
                     if *shift > MIN_OCTAVE { *shift -= 1; }
                     drop(shift);
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
                 KeyCode::Char('x') if kind == KeyEventKind::Press => {
                     let mut shift = octave_shift.lock().unwrap();
                     if *shift < MAX_OCTAVE { *shift += 1; }
                     drop(shift);
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                }
+
+                // cycle scale type
+                KeyCode::Char(']') if kind == KeyEventKind::Press => {
+                    scale = scale.next();
+                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                }
+
+                // cycle scale root note
+                KeyCode::Char('\\') if kind == KeyEventKind::Press => {
+                    root_idx = (root_idx + 1) % ROOTS.len();
+                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // velocity
                 KeyCode::Char(c @ '1'..='9') if kind == KeyEventKind::Press => {
                     velocity = c.to_digit(10).unwrap() as f32 / 9.0;
                     redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded)?;
+                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
                 }
 
                 // piano keys
@@ -522,7 +585,7 @@ fn main() -> anyhow::Result<()> {
                     let mix     = *reverb_mix.lock().unwrap();
                     let playing = *is_playing.lock().unwrap();
                     print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
-                             recording, recorded.len(), playing)?;
+                             recording, recorded.len(), playing, scale, root_idx)?;
                 }
 
                 _ => {}
@@ -548,10 +611,20 @@ fn pressed_keys(active_notes: &ActiveNotes) -> HashSet<char> {
     collect_pressed(&active_notes.lock().unwrap())
 }
 
-fn write_key(stdout: &mut impl Write, key: char, pressed: &HashSet<char>) -> anyhow::Result<()> {
-    let label = key.to_ascii_uppercase();
+fn write_key(
+    stdout:      &mut impl Write,
+    key:         char,
+    pressed:     &HashSet<char>,
+    scale_notes: &HashSet<u8>,
+) -> anyhow::Result<()> {
+    let label   = key.to_ascii_uppercase();
+    let in_scale = key_to_pitch_class(key).map_or(false, |pc| scale_notes.contains(&pc));
+
     if pressed.contains(&key) {
         queue!(stdout, SetBackgroundColor(Color::Yellow), SetForegroundColor(Color::Black),
+               Print(label), ResetColor)?;
+    } else if in_scale {
+        queue!(stdout, SetBackgroundColor(Color::DarkGreen), SetForegroundColor(Color::White),
                Print(label), ResetColor)?;
     } else {
         queue!(stdout, Print(label))?;
@@ -570,7 +643,15 @@ fn print_ui(
     recording:   bool,
     event_count: usize,
     is_playing:  bool,
+    scale:       Scale,
+    root_idx:    usize,
 ) -> anyhow::Result<()> {
+    let (root_name, root_pc) = ROOTS[root_idx];
+    let scale_notes: HashSet<u8> = scale.intervals()
+        .iter()
+        .map(|&i| (root_pc + i) % 12)
+        .collect();
+    let scale_label = format!("Scale:    {} {}  (] = scale, \\ = root)", root_name, scale.name());
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
         n if n > 0 => format!("Octave: +{}  (Z/X to shift)", n),
@@ -608,7 +689,7 @@ fn print_ui(
 
     write!(stdout, "  White:  ")?;
     for key in white_keys {
-        write_key(stdout, key, pressed)?;
+        write_key(stdout, key, pressed, &scale_notes)?;
         write!(stdout, "  ")?;
     }
     writeln!(stdout, "\r")?;
@@ -616,7 +697,7 @@ fn print_ui(
     write!(stdout, "  Black:  ")?;
     for slot in black_keys {
         match slot {
-            Some(key) => { write_key(stdout, key, pressed)?; write!(stdout, "  ")?; }
+            Some(key) => { write_key(stdout, key, pressed, &scale_notes)?; write!(stdout, "  ")?; }
             None      => { write!(stdout, "   ")?; }
         }
     }
@@ -636,6 +717,7 @@ fn print_ui(
     writeln!(stdout, "  {}\r", pedal_label)?;
     writeln!(stdout, "  {}\r", wave_label)?;
     writeln!(stdout, "  {}\r", rvb_label)?;
+    writeln!(stdout, "  {}\r", scale_label)?;
 
     write!(stdout, "  ")?;
     if recording {
