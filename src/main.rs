@@ -99,6 +99,41 @@ const ROOTS: [(&str, u8); 12] = [
     ("F#", 6), ("G", 7), ("G#", 8), ("A", 9),  ("A#", 10), ("B", 11),
 ];
 
+#[derive(Clone, Copy, PartialEq)]
+enum ArpPattern { Up, Down, UpDown }
+
+impl ArpPattern {
+    fn next(self) -> Self {
+        match self {
+            ArpPattern::Up     => ArpPattern::Down,
+            ArpPattern::Down   => ArpPattern::UpDown,
+            ArpPattern::UpDown => ArpPattern::Up,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ArpPattern::Up     => "Up",
+            ArpPattern::Down   => "Down",
+            ArpPattern::UpDown => "Up-Down",
+        }
+    }
+
+    // Returns which index into sorted held_notes to play given arp_idx
+    fn note_index(self, arp_idx: usize, n: usize) -> usize {
+        match self {
+            ArpPattern::Up   => arp_idx % n,
+            ArpPattern::Down => (n - 1).saturating_sub(arp_idx % n),
+            ArpPattern::UpDown => {
+                if n <= 1 { return 0; }
+                let cycle = 2 * (n - 1);
+                let pos   = arp_idx % cycle;
+                if pos < n { pos } else { cycle - pos }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RecordKind { Press, Release }
 
@@ -392,30 +427,69 @@ fn main() -> anyhow::Result<()> {
 
     let mut velocity:     f32                  = 5.0 / 9.0;
     let mut pedal_down:   bool                 = false;
-    let mut waveform:     Waveform             = Waveform::Sine;
-    let mut recording:    bool                 = false;
-    let mut record_start: Option<Instant>      = None;
-    let mut recorded:     Vec<RecordedEvent>   = Vec::new();
-    let mut scale:        Scale                = Scale::Major;
-    let mut root_idx:     usize                = 0; // C
+    let mut waveform:     Waveform           = Waveform::Sine;
+    let mut recording:    bool               = false;
+    let mut record_start: Option<Instant>    = None;
+    let mut recorded:     Vec<RecordedEvent> = Vec::new();
+    let mut scale:        Scale              = Scale::Major;
+    let mut root_idx:     usize              = 0; // C
+    let mut arp_on:       bool               = false;
+    let mut arp_pattern:  ArpPattern         = ArpPattern::Up;
+    let mut bpm:          f32                = 120.0;
+    let mut held_notes:   Vec<char>          = Vec::new(); // keys held while arp is on
+    let mut arp_idx:      usize              = 0;
+    let mut arp_last:     Option<char>       = None; // note last fired by arp
+    let mut last_tick:    Instant            = Instant::now();
 
-    let redraw = |stdout: &mut _, notes: &ActiveNotes, octave_shift: &OctaveShift,
-                  reverb_mix: &ReverbMix, is_playing: &IsPlaying,
-                  velocity: f32, pedal_down: bool, waveform: Waveform,
-                  recording: bool, recorded: &Vec<RecordedEvent>,
-                  scale: Scale, root_idx: usize| -> anyhow::Result<()> {
-        let pressed = pressed_keys(notes);
-        let octave  = *octave_shift.lock().unwrap();
-        let mix     = *reverb_mix.lock().unwrap();
-        let playing = *is_playing.lock().unwrap();
-        print_ui(stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
-                 recording, recorded.len(), playing, scale, root_idx)
-    };
+    macro_rules! redraw {
+        () => {{
+            let pressed = pressed_keys(&active_notes);
+            let octave  = *octave_shift.lock().unwrap();
+            let mix     = *reverb_mix.lock().unwrap();
+            let playing = *is_playing.lock().unwrap();
+            print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
+                     recording, recorded.len(), playing, scale, root_idx,
+                     arp_on, arp_pattern, bpm)?;
+        }};
+    }
 
-    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+    redraw!();
 
     loop {
+        // When arp is on, poll with a timeout so we tick the arp rhythmically.
+        // When arp is off, wait indefinitely (very long timeout = effectively blocking).
+        let beat_dur = Duration::from_millis((60_000.0 / bpm) as u64);
+        let wait = if arp_on {
+            beat_dur.saturating_sub(last_tick.elapsed())
+        } else {
+            Duration::from_secs(60)
+        };
+
+        let got_event = event::poll(wait)?;
+
+        // Arp tick: fires when poll times out (no keypress in time for next beat)
+        if !got_event && arp_on {
+            last_tick = Instant::now();
+            let mut notes = active_notes.lock().unwrap();
+            if let Some(prev) = arp_last {
+                if let Some(n) = notes.get_mut(&prev) { n.release(); }
+            }
+            let mut sorted = held_notes.clone();
+            sorted.sort_by_key(|&k| key_to_pitch_class(k).unwrap_or(0));
+            if !sorted.is_empty() {
+                let idx = arp_pattern.note_index(arp_idx, sorted.len());
+                let key = sorted[idx];
+                arp_idx += 1;
+                arp_last = Some(key);
+                notes.entry(key).or_insert_with(|| Note::new(velocity, waveform));
+            }
+            drop(notes);
+            redraw!();
+            continue;
+        }
+
+        if !got_event { continue; }
+
         if let Event::Key(KeyEvent { code, kind, .. }) = event::read()? {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => break,
@@ -431,8 +505,39 @@ fn main() -> anyhow::Result<()> {
                             if note.key_released { note.release(); }
                         }
                     }
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
+                }
+
+                // toggle arpeggiator
+                KeyCode::Tab if kind == KeyEventKind::Press => {
+                    arp_on = !arp_on;
+                    if !arp_on {
+                        // release everything when turning arp off
+                        held_notes.clear();
+                        arp_last = None;
+                        arp_idx  = 0;
+                        let mut notes = active_notes.lock().unwrap();
+                        for note in notes.values_mut() { note.release(); }
+                    }
+                    last_tick = Instant::now();
+                    redraw!();
+                }
+
+                // cycle arp pattern
+                KeyCode::Char('`') if kind == KeyEventKind::Press => {
+                    arp_pattern = arp_pattern.next();
+                    arp_idx     = 0;
+                    redraw!();
+                }
+
+                // BPM
+                KeyCode::Up if kind == KeyEventKind::Press => {
+                    bpm = (bpm + 10.0).min(300.0);
+                    redraw!();
+                }
+                KeyCode::Down if kind == KeyEventKind::Press => {
+                    bpm = (bpm - 10.0).max(40.0);
+                    redraw!();
                 }
 
                 // toggle recording
@@ -444,8 +549,7 @@ fn main() -> anyhow::Result<()> {
                         record_start = Some(Instant::now());
                         recording = true;
                     }
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
                 // playback
@@ -453,9 +557,9 @@ fn main() -> anyhow::Result<()> {
                     let already_playing = *is_playing.lock().unwrap();
                     if !already_playing && !recorded.is_empty() {
                         *is_playing.lock().unwrap() = true;
-                        let events     = recorded.clone();
-                        let notes      = Arc::clone(&active_notes);
-                        let playing    = Arc::clone(&is_playing);
+                        let events  = recorded.clone();
+                        let notes   = Arc::clone(&active_notes);
+                        let playing = Arc::clone(&is_playing);
                         std::thread::spawn(move || {
                             let mut prev = Duration::ZERO;
                             for event in events {
@@ -478,31 +582,27 @@ fn main() -> anyhow::Result<()> {
                             *playing.lock().unwrap() = false;
                         });
                     }
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
                 // cycle waveform
                 KeyCode::Char('[') if kind == KeyEventKind::Press => {
                     waveform = waveform.next();
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
-                // reverb mix
+                // reverb
                 KeyCode::Char('-') if kind == KeyEventKind::Press => {
                     let mut mix = reverb_mix.lock().unwrap();
                     *mix = (*mix - 0.1).max(0.0);
                     drop(mix);
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
                 KeyCode::Char('=') if kind == KeyEventKind::Press => {
                     let mut mix = reverb_mix.lock().unwrap();
                     *mix = (*mix + 0.1).min(0.8);
                     drop(mix);
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
                 // octave
@@ -510,82 +610,77 @@ fn main() -> anyhow::Result<()> {
                     let mut shift = octave_shift.lock().unwrap();
                     if *shift > MIN_OCTAVE { *shift -= 1; }
                     drop(shift);
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
                 KeyCode::Char('x') if kind == KeyEventKind::Press => {
                     let mut shift = octave_shift.lock().unwrap();
                     if *shift < MAX_OCTAVE { *shift += 1; }
                     drop(shift);
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
-                // cycle scale type
+                // scale type
                 KeyCode::Char(']') if kind == KeyEventKind::Press => {
                     scale = scale.next();
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
-                // cycle scale root note
+                // scale root
                 KeyCode::Char('\\') if kind == KeyEventKind::Press => {
                     root_idx = (root_idx + 1) % ROOTS.len();
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
                 // velocity
                 KeyCode::Char(c @ '1'..='9') if kind == KeyEventKind::Press => {
                     velocity = c.to_digit(10).unwrap() as f32 / 9.0;
-                    redraw(&mut stdout, &active_notes, &octave_shift, &reverb_mix, &is_playing,
-                           velocity, pedal_down, waveform, recording, &recorded, scale, root_idx)?;
+                    redraw!();
                 }
 
                 // piano keys
-                KeyCode::Char(c) => {
-                    let pressed = {
+                KeyCode::Char(c) if key_to_freq(c).is_some() => {
+                    if arp_on {
+                        if kind == KeyEventKind::Press && !held_notes.contains(&c) {
+                            held_notes.push(c);
+                            arp_idx = 0;
+                        } else if kind == KeyEventKind::Release {
+                            held_notes.retain(|&k| k != c);
+                            if held_notes.is_empty() {
+                                if let Some(prev) = arp_last {
+                                    if let Some(n) = active_notes.lock().unwrap().get_mut(&prev) {
+                                        n.release();
+                                    }
+                                }
+                                arp_last = None;
+                            }
+                        }
+                    } else {
                         let mut notes = active_notes.lock().unwrap();
-                        if kind == KeyEventKind::Press && key_to_freq(c).is_some() {
+                        if kind == KeyEventKind::Press {
                             notes.entry(c).or_insert_with(|| Note::new(velocity, waveform));
                             if recording {
                                 if let Some(start) = record_start {
                                     recorded.push(RecordedEvent {
-                                        timestamp: start.elapsed(),
-                                        key: c,
-                                        kind: RecordKind::Press,
-                                        velocity,
-                                        waveform,
+                                        timestamp: start.elapsed(), key: c,
+                                        kind: RecordKind::Press, velocity, waveform,
                                     });
                                 }
                             }
                         } else if kind == KeyEventKind::Release {
                             if let Some(note) = notes.get_mut(&c) {
-                                if pedal_down {
-                                    note.key_released = true;
-                                } else {
-                                    note.release();
-                                }
+                                if pedal_down { note.key_released = true; } else { note.release(); }
                             }
                             if recording {
                                 if let Some(start) = record_start {
                                     recorded.push(RecordedEvent {
-                                        timestamp: start.elapsed(),
-                                        key: c,
-                                        kind: RecordKind::Release,
-                                        velocity,
-                                        waveform,
+                                        timestamp: start.elapsed(), key: c,
+                                        kind: RecordKind::Release, velocity, waveform,
                                     });
                                 }
                             }
                         }
-                        collect_pressed(&notes)
-                    };
-                    let octave  = *octave_shift.lock().unwrap();
-                    let mix     = *reverb_mix.lock().unwrap();
-                    let playing = *is_playing.lock().unwrap();
-                    print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
-                             recording, recorded.len(), playing, scale, root_idx)?;
+                    }
+                    redraw!();
                 }
 
                 _ => {}
@@ -645,6 +740,9 @@ fn print_ui(
     is_playing:  bool,
     scale:       Scale,
     root_idx:    usize,
+    arp_on:      bool,
+    arp_pattern: ArpPattern,
+    bpm:         f32,
 ) -> anyhow::Result<()> {
     let (root_name, root_pc) = ROOTS[root_idx];
     let scale_notes: HashSet<u8> = scale.intervals()
@@ -667,6 +765,12 @@ fn print_ui(
     let rvb_steps = (reverb * 10.0).round() as usize;
     let rvb_bar: String = (1..=8).map(|i| if i <= rvb_steps { '█' } else { '░' }).collect();
     let rvb_label = format!("Reverb:   {}  (- / = to adjust)", rvb_bar);
+
+    let arp_label = if arp_on {
+        format!("Arp:      ON   {} BPM  {}  (Tab=off, ↑↓=BPM, `=pattern)", bpm as u32, arp_pattern.name())
+    } else {
+        format!("Arp:      off  (Tab to enable)")
+    };
 
     let tape_label = if is_playing {
         "Tape: playing back...".to_string()
@@ -718,6 +822,14 @@ fn print_ui(
     writeln!(stdout, "  {}\r", wave_label)?;
     writeln!(stdout, "  {}\r", rvb_label)?;
     writeln!(stdout, "  {}\r", scale_label)?;
+
+    write!(stdout, "  ")?;
+    if arp_on {
+        queue!(stdout, SetForegroundColor(Color::Magenta), Print(&arp_label), ResetColor)?;
+    } else {
+        write!(stdout, "{}", arp_label)?;
+    }
+    writeln!(stdout, "\r")?;
 
     write!(stdout, "  ")?;
     if recording {
