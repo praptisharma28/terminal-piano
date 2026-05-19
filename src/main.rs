@@ -9,10 +9,11 @@ use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegrou
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
 
-const ATTACK:  f32 = 0.01; // seconds to reach full volume
-const DECAY:   f32 = 0.10; // seconds to drop to sustain level
-const SUSTAIN: f32 = 0.70; // volume level held while key is down (0.0 - 1.0)
-const RELEASE: f32 = 0.30; // seconds to fade out after key is released
+const ATTACK:     f32 = 0.01; // seconds to reach full volume
+const DECAY:      f32 = 0.10; // seconds to drop to sustain level
+const SUSTAIN:    f32 = 0.70; // volume level held while key is down (0.0 - 1.0)
+const RELEASE:    f32 = 0.30; // seconds to fade out after key is released
+const TREM_DEPTH: f32 = 0.75; // how deeply tremolo dips the volume (0.0 = none, 1.0 = silence)
 
 const MIN_OCTAVE: i32 = -3;
 const MAX_OCTAVE: i32 =  3;
@@ -119,7 +120,6 @@ impl ArpPattern {
         }
     }
 
-    // Returns which index into sorted held_notes to play given arp_idx
     fn note_index(self, arp_idx: usize, n: usize) -> usize {
         match self {
             ArpPattern::Up   => arp_idx % n,
@@ -197,15 +197,12 @@ impl Note {
         let p  = self.phase;
         let pi = std::f32::consts::PI;
 
-        // Each waveform is defined by its harmonic series.
-        // Velocity scales upper harmonics — loud = bright, soft = warm.
         let (wave, gain) = match self.waveform {
             Waveform::Sine => (
                 (2.0 * pi * p).sin(),
                 1.0,
             ),
             Waveform::Triangle => (
-                // odd harmonics, alternating sign, weights fall as 1/n²
                   1.000 * (2.0 * pi * 1.0 * p).sin()
                 - 0.111 * v * (2.0 * pi * 3.0 * p).sin()
                 + 0.040 * v * (2.0 * pi * 5.0 * p).sin()
@@ -213,7 +210,6 @@ impl Note {
                 0.90,
             ),
             Waveform::Square => (
-                // odd harmonics only, weights fall as 1/n
                   1.000 * (2.0 * pi * 1.0 * p).sin()
                 + 0.333 * v * (2.0 * pi * 3.0 * p).sin()
                 + 0.200 * v * (2.0 * pi * 5.0 * p).sin()
@@ -221,7 +217,6 @@ impl Note {
                 0.60,
             ),
             Waveform::Sawtooth => (
-                // all harmonics, weights fall as 1/n
                   1.000       * (2.0 * pi * 1.0 * p).sin()
                 + 0.500 * v   * (2.0 * pi * 2.0 * p).sin()
                 + 0.333 * v   * (2.0 * pi * 3.0 * p).sin()
@@ -241,10 +236,12 @@ type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
 type OctaveShift = Arc<Mutex<i32>>;
 type ReverbMix   = Arc<Mutex<f32>>;
 type IsPlaying   = Arc<Mutex<bool>>;
+type DelayOn     = Arc<Mutex<bool>>;
+type DelayFb     = Arc<Mutex<f32>>;
+type TremOn      = Arc<Mutex<bool>>;
+type TremRate    = Arc<Mutex<f32>>;
 
 // Schroeder reverb: four parallel comb filters.
-// Each delays the signal and feeds it back into itself.
-// Different delay lengths create the illusion of multiple reflections.
 struct Reverb {
     buffers:   [Vec<f32>; 4],
     positions: [usize; 4],
@@ -274,7 +271,30 @@ impl Reverb {
             self.positions[i]    = (pos + 1) % self.buffers[i].len();
             output += delayed;
         }
-        output * 0.25 // average across the four filters
+        output * 0.25
+    }
+}
+
+// Tap delay: a single ring buffer that plays back the signal after a fixed time.
+// feedback controls how much of the delayed output is mixed back in — higher = more echoes.
+struct Delay {
+    buffer:   Vec<f32>,
+    position: usize,
+}
+
+impl Delay {
+    fn new(sample_rate: f32, ms: f32) -> Self {
+        Delay {
+            buffer:   vec![0.0; (sample_rate * ms * 0.001) as usize],
+            position: 0,
+        }
+    }
+
+    fn process(&mut self, input: f32, feedback: f32) -> f32 {
+        let delayed = self.buffer[self.position];
+        self.buffer[self.position] = input + delayed * feedback;
+        self.position = (self.position + 1) % self.buffer.len();
+        delayed
     }
 }
 
@@ -378,6 +398,10 @@ fn main() -> anyhow::Result<()> {
     let octave_shift: OctaveShift = Arc::new(Mutex::new(0));
     let reverb_mix:   ReverbMix   = Arc::new(Mutex::new(0.3));
     let is_playing:   IsPlaying   = Arc::new(Mutex::new(false));
+    let delay_on:     DelayOn     = Arc::new(Mutex::new(false));
+    let delay_fb:     DelayFb     = Arc::new(Mutex::new(0.40));
+    let tremolo_on:   TremOn      = Arc::new(Mutex::new(false));
+    let tremolo_rate: TremRate    = Arc::new(Mutex::new(4.0)); // 4 Hz default
 
     let host = cpal::default_host();
     let device = host
@@ -386,18 +410,28 @@ fn main() -> anyhow::Result<()> {
     let config = device.default_output_config()?;
     let sample_rate = config.sample_rate().0 as f32;
 
-    let notes_for_audio  = Arc::clone(&active_notes);
-    let octave_for_audio = Arc::clone(&octave_shift);
-    let mix_for_audio    = Arc::clone(&reverb_mix);
+    let notes_for_audio    = Arc::clone(&active_notes);
+    let octave_for_audio   = Arc::clone(&octave_shift);
+    let mix_for_audio      = Arc::clone(&reverb_mix);
+    let delay_on_for_audio = Arc::clone(&delay_on);
+    let delay_fb_for_audio = Arc::clone(&delay_fb);
+    let trem_on_for_audio  = Arc::clone(&tremolo_on);
+    let trem_rate_for_audio= Arc::clone(&tremolo_rate);
 
-    let mut reverb = Reverb::new(sample_rate);
+    let mut reverb    = Reverb::new(sample_rate);
+    let mut delay     = Delay::new(sample_rate, 300.0); // 300ms tap delay
+    let mut lfo_phase = 0.0_f32;
 
     let stream = device.build_output_stream(
         &config.into(),
         move |output: &mut [f32], _| {
             let mut notes = notes_for_audio.lock().unwrap();
-            let shift = *octave_for_audio.lock().unwrap();
-            let mix   = *mix_for_audio.lock().unwrap();
+            let shift  = *octave_for_audio.lock().unwrap();
+            let mix    = *mix_for_audio.lock().unwrap();
+            let d_on   = *delay_on_for_audio.lock().unwrap();
+            let d_fb   = *delay_fb_for_audio.lock().unwrap();
+            let t_on   = *trem_on_for_audio.lock().unwrap();
+            let t_rate = *trem_rate_for_audio.lock().unwrap();
             // 2^shift: shift=1 doubles the frequency (one octave up), shift=-1 halves it
             let octave_multiplier = 2.0_f32.powi(shift);
 
@@ -410,9 +444,20 @@ fn main() -> anyhow::Result<()> {
                 }
                 notes.retain(|_, note| !note.is_finished());
 
+                // signal chain: notes → delay → reverb → tremolo
                 let dry = *sample;
-                let wet = reverb.process(dry);
-                *sample = dry * (1.0 - mix) + wet * mix;
+                let delayed = delay.process(if d_on { dry } else { 0.0 }, d_fb);
+                let pre_verb = if d_on { dry * 0.65 + delayed * 0.35 } else { dry };
+                let wet = reverb.process(pre_verb);
+                let post_verb = pre_verb * (1.0 - mix) + wet * mix;
+
+                // LFO: a slow sine wave that multiplies the output volume
+                // lfo ranges -1..1 → trem_mul ranges (1 - TREM_DEPTH)..1
+                let lfo = (2.0 * std::f32::consts::PI * lfo_phase).sin();
+                let trem_mul = if t_on { 1.0 - TREM_DEPTH * 0.5 * (1.0 - lfo) } else { 1.0 };
+                lfo_phase = (lfo_phase + t_rate / sample_rate) % 1.0;
+
+                *sample = post_verb * trem_mul;
             }
         },
         |err| eprintln!("audio error: {err}"),
@@ -436,28 +481,30 @@ fn main() -> anyhow::Result<()> {
     let mut arp_on:       bool               = false;
     let mut arp_pattern:  ArpPattern         = ArpPattern::Up;
     let mut bpm:          f32                = 120.0;
-    let mut held_notes:   Vec<char>          = Vec::new(); // keys held while arp is on
+    let mut held_notes:   Vec<char>          = Vec::new();
     let mut arp_idx:      usize              = 0;
-    let mut arp_last:     Option<char>       = None; // note last fired by arp
+    let mut arp_last:     Option<char>       = None;
     let mut last_tick:    Instant            = Instant::now();
 
     macro_rules! redraw {
         () => {{
-            let pressed = pressed_keys(&active_notes);
-            let octave  = *octave_shift.lock().unwrap();
-            let mix     = *reverb_mix.lock().unwrap();
-            let playing = *is_playing.lock().unwrap();
+            let pressed  = pressed_keys(&active_notes);
+            let octave   = *octave_shift.lock().unwrap();
+            let mix      = *reverb_mix.lock().unwrap();
+            let playing  = *is_playing.lock().unwrap();
+            let d_on     = *delay_on.lock().unwrap();
+            let d_fb     = *delay_fb.lock().unwrap();
+            let t_on     = *tremolo_on.lock().unwrap();
+            let t_rate   = *tremolo_rate.lock().unwrap();
             print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
                      recording, recorded.len(), playing, scale, root_idx,
-                     arp_on, arp_pattern, bpm)?;
+                     arp_on, arp_pattern, bpm, d_on, d_fb, t_on, t_rate)?;
         }};
     }
 
     redraw!();
 
     loop {
-        // When arp is on, poll with a timeout so we tick the arp rhythmically.
-        // When arp is off, wait indefinitely (very long timeout = effectively blocking).
         let beat_dur = Duration::from_millis((60_000.0 / bpm) as u64);
         let wait = if arp_on {
             beat_dur.saturating_sub(last_tick.elapsed())
@@ -467,7 +514,6 @@ fn main() -> anyhow::Result<()> {
 
         let got_event = event::poll(wait)?;
 
-        // Arp tick: fires when poll times out (no keypress in time for next beat)
         if !got_event && arp_on {
             last_tick = Instant::now();
             let mut notes = active_notes.lock().unwrap();
@@ -512,7 +558,6 @@ fn main() -> anyhow::Result<()> {
                 KeyCode::Tab if kind == KeyEventKind::Press => {
                     arp_on = !arp_on;
                     if !arp_on {
-                        // release everything when turning arp off
                         held_notes.clear();
                         arp_last = None;
                         arp_idx  = 0;
@@ -537,6 +582,50 @@ fn main() -> anyhow::Result<()> {
                 }
                 KeyCode::Down if kind == KeyEventKind::Press => {
                     bpm = (bpm - 10.0).max(40.0);
+                    redraw!();
+                }
+
+                // toggle delay
+                KeyCode::Char('e') if kind == KeyEventKind::Press => {
+                    let mut on = delay_on.lock().unwrap();
+                    *on = !*on;
+                    drop(on);
+                    redraw!();
+                }
+
+                // delay feedback
+                KeyCode::Left if kind == KeyEventKind::Press => {
+                    let mut fb = delay_fb.lock().unwrap();
+                    *fb = (*fb - 0.1).max(0.1);
+                    drop(fb);
+                    redraw!();
+                }
+                KeyCode::Right if kind == KeyEventKind::Press => {
+                    let mut fb = delay_fb.lock().unwrap();
+                    *fb = (*fb + 0.1).min(0.7);
+                    drop(fb);
+                    redraw!();
+                }
+
+                // toggle tremolo
+                KeyCode::Char('v') if kind == KeyEventKind::Press => {
+                    let mut on = tremolo_on.lock().unwrap();
+                    *on = !*on;
+                    drop(on);
+                    redraw!();
+                }
+
+                // tremolo rate
+                KeyCode::Char('b') if kind == KeyEventKind::Press => {
+                    let mut rate = tremolo_rate.lock().unwrap();
+                    *rate = (*rate - 0.5).max(0.5);
+                    drop(rate);
+                    redraw!();
+                }
+                KeyCode::Char('n') if kind == KeyEventKind::Press => {
+                    let mut rate = tremolo_rate.lock().unwrap();
+                    *rate = (*rate + 0.5).min(10.0);
+                    drop(rate);
                     redraw!();
                 }
 
@@ -712,7 +801,7 @@ fn write_key(
     pressed:     &HashSet<char>,
     scale_notes: &HashSet<u8>,
 ) -> anyhow::Result<()> {
-    let label   = key.to_ascii_uppercase();
+    let label    = key.to_ascii_uppercase();
     let in_scale = key_to_pitch_class(key).map_or(false, |pc| scale_notes.contains(&pc));
 
     if pressed.contains(&key) {
@@ -727,6 +816,7 @@ fn write_key(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_ui(
     stdout:      &mut impl Write,
     octave:      i32,
@@ -743,13 +833,17 @@ fn print_ui(
     arp_on:      bool,
     arp_pattern: ArpPattern,
     bpm:         f32,
+    delay_on:    bool,
+    delay_fb:    f32,
+    tremolo_on:  bool,
+    tremolo_rate: f32,
 ) -> anyhow::Result<()> {
     let (root_name, root_pc) = ROOTS[root_idx];
     let scale_notes: HashSet<u8> = scale.intervals()
         .iter()
         .map(|&i| (root_pc + i) % 12)
         .collect();
-    let scale_label = format!("Scale:    {} {}  (] = scale, \\ = root)", root_name, scale.name());
+    let scale_label  = format!("Scale:    {} {}  (] = scale, \\ = root)", root_name, scale.name());
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
         n if n > 0 => format!("Octave: +{}  (Z/X to shift)", n),
@@ -758,7 +852,7 @@ fn print_ui(
 
     let level = (velocity * 9.0).round() as usize;
     let bar: String = (1..=9).map(|i| if i <= level { '█' } else { '░' }).collect();
-    let vel_label  = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
+    let vel_label   = format!("Velocity: {}  ({}/9 — keys 1-9)", bar, level);
     let pedal_label = if pedal_down { "Pedal: DOWN" } else { "Pedal: up  " };
     let wave_label  = format!("Waveform: {}  ([ to cycle)", waveform.name());
 
@@ -766,10 +860,24 @@ fn print_ui(
     let rvb_bar: String = (1..=8).map(|i| if i <= rvb_steps { '█' } else { '░' }).collect();
     let rvb_label = format!("Reverb:   {}  (- / = to adjust)", rvb_bar);
 
-    let arp_label = if arp_on {
-        format!("Arp:      ON   {} BPM  {}  (Tab=off, ↑↓=BPM, `=pattern)", bpm as u32, arp_pattern.name())
+    let fb_steps = (delay_fb * 10.0).round() as usize;
+    let fb_bar: String = (1..=7).map(|i| if i <= fb_steps { '█' } else { '░' }).collect();
+    let delay_label = if delay_on {
+        format!("Delay:    ON   fb: {}  (E=off, \u{25c4}\u{25ba}=feedback)", fb_bar)
     } else {
-        format!("Arp:      off  (Tab to enable)")
+        format!("Delay:    off  fb: {}  (E to enable, \u{25c4}\u{25ba}=feedback)", fb_bar)
+    };
+
+    let trem_label = if tremolo_on {
+        format!("Tremolo:  ON   {:.1} Hz  (V=off, B/N=rate)", tremolo_rate)
+    } else {
+        format!("Tremolo:  off  {:.1} Hz  (V to enable, B/N=rate)", tremolo_rate)
+    };
+
+    let arp_label = if arp_on {
+        format!("Arp:      ON   {} BPM  {}  (Tab=off, \u{2191}\u{2193}=BPM, `=pattern)", bpm as u32, arp_pattern.name())
+    } else {
+        "Arp:      off  (Tab to enable)".to_string()
     };
 
     let tape_label = if is_playing {
@@ -821,6 +929,23 @@ fn print_ui(
     writeln!(stdout, "  {}\r", pedal_label)?;
     writeln!(stdout, "  {}\r", wave_label)?;
     writeln!(stdout, "  {}\r", rvb_label)?;
+
+    write!(stdout, "  ")?;
+    if delay_on {
+        queue!(stdout, SetForegroundColor(Color::Yellow), Print(&delay_label), ResetColor)?;
+    } else {
+        write!(stdout, "{}", delay_label)?;
+    }
+    writeln!(stdout, "\r")?;
+
+    write!(stdout, "  ")?;
+    if tremolo_on {
+        queue!(stdout, SetForegroundColor(Color::Blue), Print(&trem_label), ResetColor)?;
+    } else {
+        write!(stdout, "{}", trem_label)?;
+    }
+    writeln!(stdout, "\r")?;
+
     writeln!(stdout, "  {}\r", scale_label)?;
 
     write!(stdout, "  ")?;
@@ -842,7 +967,7 @@ fn print_ui(
     writeln!(stdout, "\r")?;
 
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  SPACE=pedal  Z/X=octave  1-9=velocity  [=wave  -/==reverb  R=record  P=play  Q=quit\r")?;
+    writeln!(stdout, "  SPACE=pedal  Z/X=octave  1-9=velocity  [=wave  -/==reverb  E=delay  V=tremolo  R=record  P=play  Q=quit\r")?;
 
     stdout.flush()?;
     Ok(())
