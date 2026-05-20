@@ -237,6 +237,7 @@ type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
 type OctaveShift = Arc<Mutex<i32>>;
 type ReverbMix   = Arc<Mutex<f32>>;
 type IsPlaying   = Arc<Mutex<bool>>;
+type IsLooping   = Arc<Mutex<bool>>;
 type DelayOn     = Arc<Mutex<bool>>;
 type DelayFb     = Arc<Mutex<f32>>;
 type TremOn      = Arc<Mutex<bool>>;
@@ -396,11 +397,19 @@ fn key_to_freq(key: char) -> Option<f32> {
     }
 }
 
+fn stop_playback(is_looping: &IsLooping, active_notes: &ActiveNotes) {
+    *is_looping.lock().unwrap() = false;
+    for note in active_notes.lock().unwrap().values_mut() {
+        note.release();
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let active_notes: ActiveNotes = Arc::new(Mutex::new(HashMap::new()));
     let octave_shift: OctaveShift = Arc::new(Mutex::new(0));
     let reverb_mix:   ReverbMix   = Arc::new(Mutex::new(0.3));
     let is_playing:   IsPlaying   = Arc::new(Mutex::new(false));
+    let is_looping:   IsLooping   = Arc::new(Mutex::new(false));
     let delay_on:     DelayOn     = Arc::new(Mutex::new(false));
     let delay_fb:     DelayFb     = Arc::new(Mutex::new(0.40));
     let tremolo_on:   TremOn      = Arc::new(Mutex::new(false));
@@ -447,7 +456,6 @@ fn main() -> anyhow::Result<()> {
 
             for sample in output.iter_mut() {
                 // vibrato: LFO bends all note frequencies up/down by VIB_DEPTH semitones
-                // 2^(semitones/12) converts semitones to a frequency ratio
                 let vib_lfo = (2.0 * std::f32::consts::PI * vib_phase).sin();
                 let vib_mul = if v_on { 2.0_f32.powf(VIB_DEPTH * vib_lfo / 12.0) } else { 1.0 };
                 vib_phase   = (vib_phase + v_rate / sample_rate) % 1.0;
@@ -461,13 +469,12 @@ fn main() -> anyhow::Result<()> {
                 notes.retain(|_, note| !note.is_finished());
 
                 // signal chain: notes → delay → reverb → tremolo
-                let dry = *sample;
+                let dry      = *sample;
                 let delayed  = delay.process(if d_on { dry } else { 0.0 }, d_fb);
                 let pre_verb = if d_on { dry * 0.65 + delayed * 0.35 } else { dry };
                 let wet      = reverb.process(pre_verb);
                 let post_verb = pre_verb * (1.0 - mix) + wet * mix;
 
-                // tremolo: LFO scales the final output volume
                 let trem_lfo = (2.0 * std::f32::consts::PI * lfo_phase).sin();
                 let trem_mul = if t_on { 1.0 - TREM_DEPTH * 0.5 * (1.0 - trem_lfo) } else { 1.0 };
                 lfo_phase    = (lfo_phase + t_rate / sample_rate) % 1.0;
@@ -507,6 +514,7 @@ fn main() -> anyhow::Result<()> {
             let octave   = *octave_shift.lock().unwrap();
             let mix      = *reverb_mix.lock().unwrap();
             let playing  = *is_playing.lock().unwrap();
+            let looping  = *is_looping.lock().unwrap();
             let d_on     = *delay_on.lock().unwrap();
             let d_fb     = *delay_fb.lock().unwrap();
             let t_on     = *tremolo_on.lock().unwrap();
@@ -514,7 +522,7 @@ fn main() -> anyhow::Result<()> {
             let v_on     = *vibrato_on.lock().unwrap();
             let v_rate   = *vibrato_rate.lock().unwrap();
             print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
-                     recording, recorded.len(), playing, scale, root_idx,
+                     recording, recorded.len(), playing, looping, scale, root_idx,
                      arp_on, arp_pattern, bpm,
                      d_on, d_fb, t_on, t_rate, v_on, v_rate)?;
         }};
@@ -681,34 +689,69 @@ fn main() -> anyhow::Result<()> {
                     redraw!();
                 }
 
-                // playback
+                // play once — or stop if already playing
                 KeyCode::Char('p') if kind == KeyEventKind::Press => {
-                    let already_playing = *is_playing.lock().unwrap();
-                    if !already_playing && !recorded.is_empty() {
+                    let playing = *is_playing.lock().unwrap();
+                    if playing {
+                        stop_playback(&is_looping, &active_notes);
+                    } else if !recorded.is_empty() {
                         *is_playing.lock().unwrap() = true;
-                        let events  = recorded.clone();
-                        let notes   = Arc::clone(&active_notes);
-                        let playing = Arc::clone(&is_playing);
+                        let events      = recorded.clone();
+                        let notes       = Arc::clone(&active_notes);
+                        let playing_arc = Arc::clone(&is_playing);
+                        let looping_arc = Arc::clone(&is_looping);
                         std::thread::spawn(move || {
                             let mut prev = Duration::ZERO;
-                            for event in events {
-                                let wait = event.timestamp.saturating_sub(prev);
-                                std::thread::sleep(wait);
+                            for event in &events {
+                                let gap = event.timestamp.saturating_sub(prev);
+                                std::thread::sleep(gap);
                                 prev = event.timestamp;
                                 let mut notes = notes.lock().unwrap();
                                 match event.kind {
-                                    RecordKind::Press => {
-                                        notes.entry(event.key)
-                                            .or_insert_with(|| Note::new(event.velocity, event.waveform));
-                                    }
-                                    RecordKind::Release => {
-                                        if let Some(note) = notes.get_mut(&event.key) {
-                                            note.release();
-                                        }
-                                    }
+                                    RecordKind::Press   => { notes.entry(event.key).or_insert_with(|| Note::new(event.velocity, event.waveform)); }
+                                    RecordKind::Release => { if let Some(n) = notes.get_mut(&event.key) { n.release(); } }
                                 }
                             }
-                            *playing.lock().unwrap() = false;
+                            *playing_arc.lock().unwrap() = false;
+                            *looping_arc.lock().unwrap() = false;
+                        });
+                    }
+                    redraw!();
+                }
+
+                // loop playback — or stop if already looping
+                KeyCode::Char('y') if kind == KeyEventKind::Press => {
+                    let playing = *is_playing.lock().unwrap();
+                    if playing {
+                        stop_playback(&is_looping, &active_notes);
+                    } else if !recorded.is_empty() {
+                        *is_playing.lock().unwrap() = true;
+                        *is_looping.lock().unwrap() = true;
+                        let events      = recorded.clone();
+                        let notes       = Arc::clone(&active_notes);
+                        let playing_arc = Arc::clone(&is_playing);
+                        let looping_arc = Arc::clone(&is_looping);
+                        std::thread::spawn(move || {
+                            // 'playback labels this loop so we can break out of it from
+                            // inside the inner for-loop when the stop flag is set
+                            'playback: loop {
+                                let mut prev = Duration::ZERO;
+                                for event in &events {
+                                    if !*looping_arc.lock().unwrap() { break 'playback; }
+                                    let gap = event.timestamp.saturating_sub(prev);
+                                    std::thread::sleep(gap);
+                                    prev = event.timestamp;
+                                    if !*looping_arc.lock().unwrap() { break 'playback; }
+                                    let mut notes = notes.lock().unwrap();
+                                    match event.kind {
+                                        RecordKind::Press   => { notes.entry(event.key).or_insert_with(|| Note::new(event.velocity, event.waveform)); }
+                                        RecordKind::Release => { if let Some(n) = notes.get_mut(&event.key) { n.release(); } }
+                                    }
+                                }
+                                if !*looping_arc.lock().unwrap() { break; }
+                            }
+                            *playing_arc.lock().unwrap() = false;
+                            *looping_arc.lock().unwrap() = false;
                         });
                     }
                     redraw!();
@@ -868,6 +911,7 @@ fn print_ui(
     recording:    bool,
     event_count:  usize,
     is_playing:   bool,
+    is_looping:   bool,
     scale:        Scale,
     root_idx:     usize,
     arp_on:       bool,
@@ -928,12 +972,14 @@ fn print_ui(
         "Arp:      off  (Tab to enable)".to_string()
     };
 
-    let tape_label = if is_playing {
-        "Tape: playing back...".to_string()
+    let tape_label = if is_looping {
+        format!("Tape: LOOPING  ({} events)  — Y to stop", event_count)
+    } else if is_playing {
+        "Tape: playing once...  — P to stop".to_string()
     } else if recording {
         format!("Tape: RECORDING  ({} events)  — R to stop", event_count)
     } else {
-        format!("Tape: {} events stored  — R to record, P to play", event_count)
+        format!("Tape: {} events stored  — R=record  P=play once  Y=loop", event_count)
     };
 
     let chord = detect_chord(pressed);
@@ -1013,7 +1059,10 @@ fn print_ui(
     writeln!(stdout, "\r")?;
 
     write!(stdout, "  ")?;
-    if recording {
+    if is_looping {
+        queue!(stdout, SetForegroundColor(Color::Green), SetBackgroundColor(Color::DarkGreen),
+               Print(&tape_label), ResetColor)?;
+    } else if recording {
         queue!(stdout, SetForegroundColor(Color::Red), Print(&tape_label), ResetColor)?;
     } else if is_playing {
         queue!(stdout, SetForegroundColor(Color::Green), Print(&tape_label), ResetColor)?;
@@ -1023,7 +1072,7 @@ fn print_ui(
     writeln!(stdout, "\r")?;
 
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  SPACE=pedal  Z/X=octave  1-9=vel  [=wave  -/==reverb  E=delay  V=tremolo  C=vibrato  R=record  P=play  Q=quit\r")?;
+    writeln!(stdout, "  SPACE=pedal  Z/X=octave  1-9=vel  [=wave  -/==reverb  E=delay  V=tremolo  C=vibrato  R=record  P=play  Y=loop  Q=quit\r")?;
 
     stdout.flush()?;
     Ok(())
