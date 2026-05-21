@@ -16,8 +16,10 @@ const RELEASE:    f32 = 0.30; // seconds to fade out after key is released
 const TREM_DEPTH: f32 = 0.75; // how deeply tremolo dips the volume (0.0 = none, 1.0 = silence)
 const VIB_DEPTH:  f32 = 0.50; // vibrato pitch swing in semitones (±0.5 semitones)
 
-const MIN_OCTAVE: i32 = -3;
-const MAX_OCTAVE: i32 =  3;
+const MIN_OCTAVE:    i32 = -3;
+const MAX_OCTAVE:    i32 =  3;
+const MIN_TRANSPOSE: i32 = -12;
+const MAX_TRANSPOSE: i32 =  12;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
@@ -235,6 +237,7 @@ impl Note {
 
 type ActiveNotes = Arc<Mutex<HashMap<char, Note>>>;
 type OctaveShift = Arc<Mutex<i32>>;
+type Transpose   = Arc<Mutex<i32>>;
 type ReverbMix   = Arc<Mutex<f32>>;
 type IsPlaying   = Arc<Mutex<bool>>;
 type IsLooping   = Arc<Mutex<bool>>;
@@ -329,10 +332,12 @@ fn note_name(pc: u8) -> &'static str {
     }
 }
 
-fn detect_chord(pressed: &HashSet<char>) -> String {
+// transpose: semitone shift to apply to each key's pitch class before chord/scale matching
+fn detect_chord(pressed: &HashSet<char>, transpose: i32) -> String {
     let pcs: Vec<u8> = pressed
         .iter()
-        .filter_map(|&k| key_to_pitch_class(k))
+        .filter_map(|&k| key_to_pitch_class(k)
+            .map(|pc| (pc as i32 + transpose).rem_euclid(12) as u8))
         .collect::<std::collections::BTreeSet<u8>>()
         .into_iter()
         .collect();
@@ -407,6 +412,7 @@ fn stop_playback(is_looping: &IsLooping, active_notes: &ActiveNotes) {
 fn main() -> anyhow::Result<()> {
     let active_notes: ActiveNotes = Arc::new(Mutex::new(HashMap::new()));
     let octave_shift: OctaveShift = Arc::new(Mutex::new(0));
+    let transpose:    Transpose   = Arc::new(Mutex::new(0));
     let reverb_mix:   ReverbMix   = Arc::new(Mutex::new(0.3));
     let is_playing:   IsPlaying   = Arc::new(Mutex::new(false));
     let is_looping:   IsLooping   = Arc::new(Mutex::new(false));
@@ -424,15 +430,16 @@ fn main() -> anyhow::Result<()> {
     let config = device.default_output_config()?;
     let sample_rate = config.sample_rate().0 as f32;
 
-    let notes_for_audio     = Arc::clone(&active_notes);
-    let octave_for_audio    = Arc::clone(&octave_shift);
-    let mix_for_audio       = Arc::clone(&reverb_mix);
-    let delay_on_for_audio  = Arc::clone(&delay_on);
-    let delay_fb_for_audio  = Arc::clone(&delay_fb);
-    let trem_on_for_audio   = Arc::clone(&tremolo_on);
-    let trem_rate_for_audio = Arc::clone(&tremolo_rate);
-    let vib_on_for_audio    = Arc::clone(&vibrato_on);
-    let vib_rate_for_audio  = Arc::clone(&vibrato_rate);
+    let notes_for_audio      = Arc::clone(&active_notes);
+    let octave_for_audio     = Arc::clone(&octave_shift);
+    let transp_for_audio     = Arc::clone(&transpose);
+    let mix_for_audio        = Arc::clone(&reverb_mix);
+    let delay_on_for_audio   = Arc::clone(&delay_on);
+    let delay_fb_for_audio   = Arc::clone(&delay_fb);
+    let trem_on_for_audio    = Arc::clone(&tremolo_on);
+    let trem_rate_for_audio  = Arc::clone(&tremolo_rate);
+    let vib_on_for_audio     = Arc::clone(&vibrato_on);
+    let vib_rate_for_audio   = Arc::clone(&vibrato_rate);
 
     let mut reverb    = Reverb::new(sample_rate);
     let mut delay     = Delay::new(sample_rate, 300.0); // 300ms tap delay
@@ -444,6 +451,7 @@ fn main() -> anyhow::Result<()> {
         move |output: &mut [f32], _| {
             let mut notes  = notes_for_audio.lock().unwrap();
             let shift      = *octave_for_audio.lock().unwrap();
+            let transp     = *transp_for_audio.lock().unwrap();
             let mix        = *mix_for_audio.lock().unwrap();
             let d_on       = *delay_on_for_audio.lock().unwrap();
             let d_fb       = *delay_fb_for_audio.lock().unwrap();
@@ -451,11 +459,11 @@ fn main() -> anyhow::Result<()> {
             let t_rate     = *trem_rate_for_audio.lock().unwrap();
             let v_on       = *vib_on_for_audio.lock().unwrap();
             let v_rate     = *vib_rate_for_audio.lock().unwrap();
-            // 2^shift: shift=1 doubles the frequency (one octave up), shift=-1 halves it
+            // 2^shift doubles/halves frequency per octave; 2^(n/12) does the same per semitone
             let octave_mul = 2.0_f32.powi(shift);
+            let transp_mul = 2.0_f32.powf(transp as f32 / 12.0);
 
             for sample in output.iter_mut() {
-                // vibrato: LFO bends all note frequencies up/down by VIB_DEPTH semitones
                 let vib_lfo = (2.0 * std::f32::consts::PI * vib_phase).sin();
                 let vib_mul = if v_on { 2.0_f32.powf(VIB_DEPTH * vib_lfo / 12.0) } else { 1.0 };
                 vib_phase   = (vib_phase + v_rate / sample_rate) % 1.0;
@@ -463,7 +471,7 @@ fn main() -> anyhow::Result<()> {
                 *sample = 0.0;
                 for (key, note) in notes.iter_mut() {
                     if let Some(freq) = key_to_freq(*key) {
-                        *sample += note.tick(freq * octave_mul * vib_mul, sample_rate);
+                        *sample += note.tick(freq * octave_mul * transp_mul * vib_mul, sample_rate);
                     }
                 }
                 notes.retain(|_, note| !note.is_finished());
@@ -512,6 +520,7 @@ fn main() -> anyhow::Result<()> {
         () => {{
             let pressed  = pressed_keys(&active_notes);
             let octave   = *octave_shift.lock().unwrap();
+            let transp   = *transpose.lock().unwrap();
             let mix      = *reverb_mix.lock().unwrap();
             let playing  = *is_playing.lock().unwrap();
             let looping  = *is_looping.lock().unwrap();
@@ -521,7 +530,7 @@ fn main() -> anyhow::Result<()> {
             let t_rate   = *tremolo_rate.lock().unwrap();
             let v_on     = *vibrato_on.lock().unwrap();
             let v_rate   = *vibrato_rate.lock().unwrap();
-            print_ui(&mut stdout, octave, &pressed, velocity, pedal_down, waveform, mix,
+            print_ui(&mut stdout, octave, transp, &pressed, velocity, pedal_down, waveform, mix,
                      recording, recorded.len(), playing, looping, scale, root_idx,
                      arp_on, arp_pattern, bpm,
                      d_on, d_fb, t_on, t_rate, v_on, v_rate)?;
@@ -577,6 +586,20 @@ fn main() -> anyhow::Result<()> {
                             if note.key_released { note.release(); }
                         }
                     }
+                    redraw!();
+                }
+
+                // transpose
+                KeyCode::PageUp if kind == KeyEventKind::Press => {
+                    let mut t = transpose.lock().unwrap();
+                    if *t < MAX_TRANSPOSE { *t += 1; }
+                    drop(t);
+                    redraw!();
+                }
+                KeyCode::PageDown if kind == KeyEventKind::Press => {
+                    let mut t = transpose.lock().unwrap();
+                    if *t > MIN_TRANSPOSE { *t -= 1; }
+                    drop(t);
                     redraw!();
                 }
 
@@ -732,8 +755,6 @@ fn main() -> anyhow::Result<()> {
                         let playing_arc = Arc::clone(&is_playing);
                         let looping_arc = Arc::clone(&is_looping);
                         std::thread::spawn(move || {
-                            // 'playback labels this loop so we can break out of it from
-                            // inside the inner for-loop when the stop flag is set
                             'playback: loop {
                                 let mut prev = Duration::ZERO;
                                 for event in &events {
@@ -903,6 +924,7 @@ fn write_key(
 fn print_ui(
     stdout:       &mut impl Write,
     octave:       i32,
+    transp:       i32,
     pressed:      &HashSet<char>,
     velocity:     f32,
     pedal_down:   bool,
@@ -925,15 +947,21 @@ fn print_ui(
     vibrato_rate: f32,
 ) -> anyhow::Result<()> {
     let (root_name, root_pc) = ROOTS[root_idx];
+    // scale notes are shifted by transpose so highlighting stays in sync with what you hear
     let scale_notes: HashSet<u8> = scale.intervals()
         .iter()
-        .map(|&i| (root_pc + i) % 12)
+        .map(|&i| (root_pc as i32 + i as i32 + transp).rem_euclid(12) as u8)
         .collect();
     let scale_label  = format!("Scale:    {} {}  (] = scale, \\ = root)", root_name, scale.name());
     let octave_label = match octave {
         0 => "Octave:  0  (default)".to_string(),
         n if n > 0 => format!("Octave: +{}  (Z/X to shift)", n),
         n => format!("Octave: {}  (Z/X to shift)", n),
+    };
+    let transp_label = match transp {
+        0 => "Transpose:  0 semitones  (PgUp/PgDn)".to_string(),
+        n if n > 0 => format!("Transpose: +{} semitones  (PgUp/PgDn)", n),
+        n => format!("Transpose: {} semitones  (PgUp/PgDn)", n),
     };
 
     let level = (velocity * 9.0).round() as usize;
@@ -982,7 +1010,7 @@ fn print_ui(
         format!("Tape: {} events stored  — R=record  P=play once  Y=loop", event_count)
     };
 
-    let chord = detect_chord(pressed);
+    let chord = detect_chord(pressed, transp);
 
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -1019,6 +1047,15 @@ fn print_ui(
     }
     writeln!(stdout, "\r")?;
     writeln!(stdout, "  {}\r", octave_label)?;
+
+    write!(stdout, "  ")?;
+    if transp != 0 {
+        queue!(stdout, SetForegroundColor(Color::Yellow), Print(&transp_label), ResetColor)?;
+    } else {
+        write!(stdout, "{}", transp_label)?;
+    }
+    writeln!(stdout, "\r")?;
+
     writeln!(stdout, "  {}\r", vel_label)?;
     writeln!(stdout, "  {}\r", pedal_label)?;
     writeln!(stdout, "  {}\r", wave_label)?;
@@ -1072,7 +1109,8 @@ fn print_ui(
     writeln!(stdout, "\r")?;
 
     writeln!(stdout, "\r")?;
-    writeln!(stdout, "  SPACE=pedal  Z/X=octave  1-9=vel  [=wave  -/==reverb  E=delay  V=tremolo  C=vibrato  R=record  P=play  Y=loop  Q=quit\r")?;
+    writeln!(stdout, "  SPACE=pedal  Z/X=octave  PgUp/PgDn=transpose  1-9=vel  [=wave  -/==reverb\r")?;
+    writeln!(stdout, "  E=delay  V=tremolo  C=vibrato  Tab=arp  R=record  P=play  Y=loop  Q=quit\r")?;
 
     stdout.flush()?;
     Ok(())
